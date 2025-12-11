@@ -1,40 +1,36 @@
+# game_state.py
 from dataclasses import dataclass, field
-from typing import Dict, Any, List
+from typing import Dict, List
 
 
 @dataclass
 class GameState:
-    """
-    Symbolic state for the Death Note / Kira-style suspicion game.
-    """
-
-    # How many turns (user actions) have happened so far
+    # Turn counter
     turn: int = 0
 
-    # High-level story location / phase
+    # High-level location in the world
+    # "intro" is only for the very first message, then we go to "home"
     location: str = "intro"
 
-    # Suspicion meters (0–100) for different groups
-    suspicion_L: int = 20          # baseline suspicion from L-like detective
-    suspicion_task_force: int = 10 # police task force suspicion
-    suspicion_public: int = 0      # general public / media suspicion
+    # Suspicion meters (0–100) – all start at 0 now
+    suspicion_L: int = 0
+    suspicion_task_force: int = 0
+    suspicion_public: int = 0
 
-    # Whether the Death Note is still hidden and safe
+    # Notebook and investigation flags
     notebook_hidden: bool = True
-
-    # NEW: how far along you are in investigating L's identity (0–3)
     l_investigation_progress: int = 0
 
-    # Free-form flags you might want later
-    flags: Dict[str, Any] = field(default_factory=dict)
+    # Surveillance at home
+    cameras_at_home: bool = False              # L has installed cameras
+    cameras_revealed_to_player: bool = False   # player has noticed them
 
-    # Conversation / narration history
+    # Misc flags + history of messages
+    flags: Dict[str, bool] = field(default_factory=dict)
     history: List[Dict[str, str]] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert to a plain dict for JSON responses.
-        """
+    def to_dict(self) -> Dict:
+        """Return a JSON-friendly version of the state for the frontend."""
         return {
             "turn": self.turn,
             "location": self.location,
@@ -43,6 +39,6 @@ class GameState:
             "suspicion_public": self.suspicion_public,
             "notebook_hidden": self.notebook_hidden,
             "l_investigation_progress": self.l_investigation_progress,
-            "flags": self.flags,
-            "history": self.history,
+            "cameras_at_home": self.cameras_at_home,
+            "cameras_revealed_to_player": self.cameras_revealed_to_player,
         }

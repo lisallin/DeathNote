@@ -1,166 +1,186 @@
 """
 logic.py
 
-What this file does (simple version):
+Simple summary for the video/report:
 
 - This file is the "brain" of our Kira Suspicion Simulator.
-- It decides how the story state changes after each player action.
+- It decides how the game state changes after each player action.
 
 Key ideas:
-- We keep all important information in a GameState object, such as:
-  - suspicion_L, suspicion_task_force, suspicion_public (0–100)
-  - notebook_hidden (True/False)
-  - l_investigation_progress (0–3)
-  - location (e.g., "intro", "day_1", "caught", "victory")
-
+- We keep the full game in a GameState object (turn, location, suspicion levels,
+  progress investigating L, camera flags, etc.).
 - The main function is run_step(state, user_input):
   1. Read what the player typed.
-  2. Classify it into an action label
-     (write_name, alibi, cooperate, hide_notebook, lay_low,
-      investigate_L, discover_L_name, other).
-  3. Update the GameState in a fully deterministic way
-     (change suspicion, progress, and location).
-  4. Check if the player has:
-     - lost: caught by L or the Task Force, or
-     - won: either created a "new world order" or discovered L's true name.
-  5. Optionally call GPT to generate a short narration of what happened.
-
-- The important point for the project:
-  All game logic and suspicion changes are controlled by this Python code.
-  GPT is only used to turn the updated state into nice story text.
+  2. Map it to an action label (write_name, alibi, cooperate, lay_low,
+     move_home, move_school, investigate_L, discover_L_name, watch_tv, etc.).
+  3. Update the GameState in a deterministic way (change suspicion, location).
+  4. Check win/lose conditions.
+  5. Call GPT to write a short narration based on the new state.
+- All rules, suspicion changes, and endings are in this Python file.
+  GPT is only used to turn the state into story text.
 """
 
+import os
+import random
+from typing import Tuple
 
-# Standard library imports
-import os  # used to read the API key from environment variables
-from typing import Tuple  # used for type hints on run_step return type
-
-# Local import: our symbolic state definition
 from game_state import GameState
-
-# OpenAI SDK import (make sure you installed it with: pip install openai)
 from openai import OpenAI
 
-# Create a client for the OpenAI API.
-# It reads the key from the environment variable OPENAI_API_KEY.
+# OpenAI client – uses the OPENAI_API_KEY environment variable
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# If there is no API key set, we will not call GPT.
-# USE_GPT becomes True only when the key exists.
-USE_GPT = os.getenv("OPENAI_API_KEY") is not None
+# Flag keys
+TV_TARGET_FLAG = "tv_target_ready"
+SECOND_KIRA_REVEALED_FLAG = "second_kira_revealed"
+SECOND_KIRA_FRIEND_FLAG = "second_kira_friend"
+
+# Some placeholder criminal names for flavor when TV shows a target
+CRIMINAL_NAMES = [
+    "Hideo Takahashi",
+    "Mika Tanaka",
+    "Daisuke Mori",
+    "Ryoji Nakamura",
+    "Kazuo Arai",
+]
 
 
 def _clamp(x: int, lo: int = 0, hi: int = 100) -> int:
-    """
-    Helper function: clamp an integer x into the range [lo, hi].
-    Used for keeping suspicion values within 0–100.
-    """
+    """Clamp an integer into [lo, hi]."""
     return max(lo, min(hi, x))
 
 
 def _suspicion_summary(state: GameState) -> str:
     """
-    Build a human-readable summary of the current suspicion levels
-    and L-investigation progress. This is useful for debugging and
-    for your milestone video.
+    Short debug summary for the status command.
+    Includes location and whether cameras have been noticed.
     """
+    camera_text = "no known cameras at home"
+    if state.cameras_revealed_to_player:
+        camera_text = "hidden cameras detected at home"
+
     return (
+        f"Current location: {state.location}\n"
+        f"Home security: {camera_text}\n"
         "Suspicion levels:\n"
         f"- L: {state.suspicion_L}/100\n"
         f"- Task Force: {state.suspicion_task_force}/100\n"
-        f"- Public: {state.suspicion_public}/100\n"
         f"L-investigation progress: {state.l_investigation_progress}/3\n"
     )
 
 
 # ---------------- GPT NARRATION HELPERS ---------------- #
 
-# SYSTEM_PROMPT acts as our "training data" and style guide for GPT.
-# It defines:
-# - The role of the model (narrator for a Kira-style game).
-# - Rules for how to describe events.
-# - A couple of example STATE/ACTION/INPUT -> ASSISTANT outputs.
 SYSTEM_PROMPT = """
-You are the narrator for an interactive fiction game inspired by Death Note.
-The player is secretly Kira. Your job is to describe what happens each turn
-in 1–3 short paragraphs, based on:
+You are the narrator for an interactive fiction game closely inspired by the
+early episodes of the anime Death Note (the Light vs L arc).
 
-- The current state (location, suspicion levels, whether the notebook is hidden).
-- The action label (write_name, alibi, cooperate, hide_notebook, lay_low,
-  investigate_L, discover_L_name, status, other).
+The player is secretly Kira: a brilliant student living with their family in
+modern Japan. On the surface, they have just agreed to cooperate with L and
+the Task Force to help "catch Kira," while hiding the fact that they are Kira.
+
+Your job is to describe what happens each turn in 1–3 short paragraphs,
+based on:
+
+- The current state (location, suspicion levels, cameras at home, etc.).
+- The action label (write_name, write_name_without_tv, watch_tv, alibi,
+  cooperate, hide_notebook, lay_low, move_home, move_school,
+  move_task_force_hq, move_downtown, investigate_L, discover_L_name,
+  befriend_second_kira, look_around, status, other).
 - The player's raw text input.
 
-Rules:
-- Never reveal exact numbers for suspicion, but it's okay to hint if suspicion is low,
-  moderate, high, or dangerously high.
-- Assume a genius detective similar to L is extremely smart and often becomes more
-  suspicious when the player seems too helpful or too perfect.
-- The Task Force is easier to reassure with alibis and public cooperation.
-- The public reacts mainly to patterns in the media (many dramatic deaths raise fear
-  and rumors, but they calm down when nothing happens).
-- Do not mention that you are an AI or talk about prompts or system messages.
-- You may occasionally include short dialogue lines in quotes.
+The STATE string may also contain:
+- second_kira_revealed=True/False → the Task Force and the player know there
+  is a "second Kira" from a TV broadcast.
+- second_kira_friend=True/False → the player has quietly formed an alliance
+  with the second Kira.
 
-Example 1
-STATE: location=day_1, suspicion_L=35, suspicion_task_force=20, suspicion_public=10, notebook_hidden=True
-ACTION: write_name
-PLAYER_INPUT: "I write the name of the serial killer I just saw on TV."
+Tone & style:
+- Make it feel like a tense episode of Death Note: a quiet cat-and-mouse game
+  between Kira and L, with lots of inner tension and subtle dread.
+- Focus on what a Light-like Kira does and how L and the Task Force react in
+  the background: surveillance, deductions, late-night meetings.
+- Keep it grounded in modern Japan: news broadcasts, cram school, police HQ,
+  press conferences, TV in classrooms, crowded city streets.
 
-ASSISTANT:
-You flip open the notebook as the news anchor repeats the killer's name.
-The letters feel heavier than ink as you write, imagining the cameras,
-the courtroom, the smug expression that will never appear now.
+Suspicion logic (how to talk about it):
+- You will see suspicion_L and suspicion_task_force (0–100).
+- Never say the exact numbers; only words like:
+  low / moderate / high / dangerous / on the verge.
+- Rough mapping for your descriptions:
+  - 0–30  → low
+  - 31–60 → moderate
+  - 61–80 → high
+  - 81–100 → dangerous / on the verge
+- When suspicion_L is low, L has only vague theories and watches from afar.
+- When suspicion_L is moderate, hint that L is narrowing his list:
+  focusing on students, police families, time-of-day patterns.
+- When suspicion_L is high, L actively targets the player:
+  hidden cameras like in the Yagami house, tailing, specific tests and traps.
+- When suspicion_L is dangerous, describe L as almost ready to accuse or arrest,
+  matching death patterns to the player’s movements.
+- The Task Force is easier to reassure with alibis and cooperation, but they
+  can still be convinced if the timing is too perfect or too convenient.
 
-Hours later, the news breaks again—this time with a sudden death.
-The Task Force scrambles, and somewhere in a dark room, a pale detective
-quietly updates his notes. The timing is too precise to ignore.
+Location flavor:
+- home: Feels like Light’s bedroom. If cameras_at_home is true, home scenes
+  should feel watched and unsafe whenever the notebook is even mentioned.
+- school: Ordinary student life on the surface; classmates gossip about Kira,
+  teachers leave the news on, rumors spread in the hallways.
+- task_force_hq: A secretive base where L and the Task Force analyze data.
+  The player must act extra careful and helpful here.
+- downtown: Anonymous crowds, TVs in shop windows, random people debating
+  whether Kira is justice or a monster.
 
-Example 2
-STATE: location=day_1, suspicion_L=40, suspicion_task_force=15, suspicion_public=5, notebook_hidden=True
-ACTION: alibi
-PLAYER_INPUT: "I make sure I'm seen studying at the library."
+Special game rule – TV prerequisite:
+- The field tv_target_ready in STATE tells you if the player has recently
+  watched a TV or public screen and has a fresh target from a broadcast.
+- tv_target_ready can become true either when the player explicitly watches TV
+  or when they happen to see a criminal's face and name on a public screen
+  while moving between locations.
+- If tv_target_ready is False and ACTION is write_name or write_name_without_tv:
+  no one dies this turn. Describe hesitation, lack of a clear target, or the
+  player realizing they need a name and face from a broadcast first.
+- If tv_target_ready is True and ACTION is write_name:
+  you may describe a successful Kira-style killing, usually tied to something
+  the player would have just seen on TV or a screen. After that, assume
+  tv_target_ready will be False again on the next turn.
 
-ASSISTANT:
-You arrive at the library early, making a point of greeting the staff by name.
-Your laptop screen glows with mock notes while you occasionally ask loud,
-boring questions about assignments.
-
-When the next incident hits the news, the Task Force can place you
-nowhere near the scene. They mark you down as cooperative and studious—
-but somewhere behind a monitor, a single set of eyes underlines your name twice.
+General rules:
+- L is extremely smart and often becomes more suspicious when the player looks
+  too perfect or too eager to help.
+- Subtlety is better than explosions: focus on glances, pauses, and quiet
+  realizations more than action scenes.
+- If second_kira_friend is True, the player and second Kira cooperate in a
+  dangerous, unstable way that sometimes helps them read L's behavior.
+- Do not talk about prompts, system messages, or that you are an AI.
+- Do not contradict the given state; instead, interpret and dramatize it like
+  a Death Note episode.
 """
 
 
 def _state_to_text(state: GameState) -> str:
-    """
-    Serialize important parts of state into a compact string that we
-    pass to GPT. This lets the model know the current situation.
-    """
+    """Serialize key parts of state into one line for GPT."""
+    tv_ready = bool(state.flags.get(TV_TARGET_FLAG, False))
+    second_seen = bool(state.flags.get(SECOND_KIRA_REVEALED_FLAG, False))
+    second_friend = bool(state.flags.get(SECOND_KIRA_FRIEND_FLAG, False))
     return (
         f"location={state.location}, "
         f"suspicion_L={state.suspicion_L}, "
         f"suspicion_task_force={state.suspicion_task_force}, "
-        f"suspicion_public={state.suspicion_public}, "
         f"notebook_hidden={state.notebook_hidden}, "
-        f"l_investigation_progress={state.l_investigation_progress}"
+        f"l_investigation_progress={state.l_investigation_progress}, "
+        f"cameras_at_home={state.cameras_at_home}, "
+        f"tv_target_ready={tv_ready}, "
+        f"second_kira_revealed={second_seen}, "
+        f"second_kira_friend={second_friend}"
     )
 
 
 def generate_narration(state: GameState, user_input: str, action_label: str) -> str:
-    """
-    Call GPT to generate a narrative paragraph based on:
-    - the current symbolic state (converted to text),
-    - the player's raw input,
-    - the abstract action label we detected.
-
-    Returns the string narration from the model.
-    """
-    # Convert the GameState into a single string line for the prompt
+    """Call GPT to generate a narrative paragraph."""
     state_text = _state_to_text(state)
 
-    # Construct the chat messages:
-    # - system: contains the rules and examples
-    # - user: contains the current STATE/ACTION/PLAYER_INPUT triple
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -174,52 +194,75 @@ def generate_narration(state: GameState, user_input: str, action_label: str) -> 
         },
     ]
 
-    # Call the Chat Completions API
     completion = client.chat.completions.create(
-        model="gpt-4.1-mini",   # model name (can be swapped to another compatible model)
-        messages=messages,      # the messages array we built above
-        temperature=0.8,        # some randomness for creative narration
-        max_tokens=350,         # limit on narration length
+        model="gpt-4.1-mini",
+        messages=messages,
+        temperature=0.8,
+        max_tokens=350,
     )
 
-    # Extract the text content from the first choice of the response
     return completion.choices[0].message.content.strip()
+
+
+# ------------- RANDOM TV TARGET HELPER ------------- #
+
+def _maybe_grant_tv_target(state: GameState, event_messages: list) -> None:
+    """
+    Small chance to see a criminal on TV when moving between locations.
+
+    If tv_target_ready is False and the random roll succeeds, we:
+    - pick a random criminal name
+    - set TV_TARGET_FLAG to True
+    - append an event message telling the player they now have a usable target
+    """
+    if state.flags.get(TV_TARGET_FLAG, False):
+        return  # already have a target
+
+    # ~35% chance each time you move
+    if random.random() < 0.35:
+        state.flags[TV_TARGET_FLAG] = True
+        name = random.choice(CRIMINAL_NAMES)
+
+        # Location-flavored description
+        if state.location == "home":
+            place = "a news report on the living room TV"
+        elif state.location == "school":
+            place = "a TV left on in the school hallway"
+        elif state.location == "task_force_hq":
+            place = "a muted news feed playing in the Task Force's lobby"
+        else:  # downtown
+            place = "a row of bright TVs in a shop window"
+
+        msg = (
+            f"As you move, {place} catches your eye.\n"
+            f"The anchors repeat the name and show the face of a wanted criminal: {name}.\n"
+            "You now have a clear name and face in mind—you could write this person in the notebook."
+        )
+        event_messages.append(msg)
 
 
 # ---------------- MAIN GAME LOGIC ---------------- #
 
 def run_step(state: GameState, user_input: str) -> Tuple[GameState, str]:
     """
-    Core logic for the Kira suspicion demo.
-
-    Steps:
-    - Increment turn and log the input.
-    - Map the text to an action label.
-    - Update the state (suspicion, flags, location).
-    - Check for win or lose conditions.
-    - Ask GPT for narration (if enabled) or use a fallback text.
-    - Return updated state and the system_output string.
-
-    Terminal states:
-    - state.location == "caught"   -> lose (Kira exposed)
-    - state.location == "victory"  -> win (either new world order or L-name route)
+    Core logic for one player action.
+    Updates the GameState and returns (state, system_output_text).
     """
 
-    # Increase the turn count each time we get an input
     state.turn += 1
-
-    # Record the player's message in the history
     state.history.append({"user": user_input})
 
-    # Normalize the input for easier substring checks
     text = user_input.lower().strip()
-
-    # Default action label: "other" (used when no specific pattern matches)
     action_label = "other"
 
-    # ---------- Early exits: already in a terminal state ---------- #
+    # special event messages we might attach to the response
+    event_messages: list[str] = []
 
-    # If the player has already been caught, don't update state further
+    # Should we clear the TV target *after* narration?
+    consume_tv_target_after = False
+
+    # ---------- Terminal states: already caught / victory ---------- #
+
     if state.location == "caught":
         system_output = (
             "You have already been exposed as Kira.\n"
@@ -228,95 +271,209 @@ def run_step(state: GameState, user_input: str) -> Tuple[GameState, str]:
         state.history.append({"system": system_output})
         return state, system_output
 
-    # If the player already reached victory, keep state frozen
     if state.location == "victory":
         system_output = (
             "You have already reshaped this timeline according to your will.\n"
-            "The investigation is over; this world belongs to Kira.\n"
             "Use the Reset button if you want to attempt a different path."
         )
         state.history.append({"system": system_output})
         return state, system_output
 
-    # ---------- Intro phase: only happens once at the beginning ---------- #
+    # ---------- Intro / welcome screen ---------- #
 
     if state.location == "intro":
-        # Provide a fixed intro description (no GPT here, to keep it deterministic)
         system_output = (
-            "You are secretly Kira, armed with a supernatural notebook.\n"
-            "A brilliant detective and a dedicated Task Force suspect that Kira "
-            "is hiding in your city, but they don't know it's you yet.\n\n"
+            "Welcome to the Kira Suspicion Simulator.\n\n"
+            "You are secretly Kira, using a supernatural notebook that can kill.\n"
+            "Publicly, you have just agreed to work with L and the Task Force to help\n"
+            "catch 'Kira'—without letting anyone realize that Kira is you.\n\n"
+            "In this version of the story, you can only write a name after you've\n"
+            "recently watched a TV or public screen and seen someone's face and name.\n\n"
             "Type what you want to do each turn. For example:\n"
-            "- 'write a criminal's name'\n"
+            "- 'watch tv' or 'watch the news'\n"
+            "- 'write a criminal's name' (after watching a screen)\n"
+            "- 'look around' to see where you can move\n"
             "- 'cooperate with the investigation'\n"
             "- 'create an alibi'\n"
             "- 'lay low'\n"
             "- 'investigate L'\n"
-            "- 'status' to see suspicion levels\n\n"
-            "Your goal is to use the notebook without letting suspicion reach 100, "
-            "or to uncover the detective's true name before they catch you."
+            "- move: 'go home', 'go to school', 'go to task force hq', 'go downtown'\n"
+            "- 'status' to see location and suspicion levels\n\n"
+            "Your goal is to use the notebook without letting suspicion reach 100,\n"
+            "or to uncover the detective's true name before he catches you."
         )
-        # Move to the main phase of the story
-        state.location = "day_1"
-        # Record system output in history and return
+        # after intro, start at home
+        state.location = "home"
         state.history.append({"system": system_output})
         return state, system_output
 
-    # ---------- Status command: show numeric state (no GPT needed) ---------- #
+    # ---------- Status command ---------- #
 
     if text == "status":
-        # Build a textual summary using the helper
         system_output = _suspicion_summary(state)
         state.history.append({"system": system_output})
         return state, system_output
 
-    # ---------- Action branches that change suspicion and progress ---------- #
+    # ---------- Look around: list possible moves ---------- #
 
-    # Using the notebook to write someone's name
+    if text in ["look", "look around", "look around the room", "where can i go"]:
+        action_label = "look_around"
+        system_output = (
+            f"You look around. Right now you are at: {state.location}.\n\n"
+            "From here, you can move to:\n"
+            "- home\n"
+            "- school\n"
+            "- task force hq\n"
+            "- downtown\n\n"
+            "Use commands like 'go home', 'go to school', "
+            "'go to task force hq', or 'go downtown'."
+        )
+        state.history.append({"system": system_output})
+        return state, system_output
+
+    # ---------- Action branches ---------- #
+
+    # Use the notebook (requires recent TV/screen target)
     if "write" in text and "name" in text:
-        action_label = "write_name"
-        # Notebook hidden status stays the same (but logic is here if you want to change it later)
-        state.notebook_hidden = state.notebook_hidden
-        # Aggressive use of the notebook makes L and the Task Force suspicious, and affects the public
-        state.suspicion_L = _clamp(state.suspicion_L + 15)
-        state.suspicion_task_force = _clamp(state.suspicion_task_force + 10)
-        state.suspicion_public = _clamp(state.suspicion_public + 5)
+        if not state.flags.get(TV_TARGET_FLAG, False):
+            # Attempt to write without a fresh TV target – blocked
+            action_label = "write_name_without_tv"
+            # Slight increase in L suspicion: patterns of hesitation / fewer deaths
+            state.suspicion_L = _clamp(state.suspicion_L + 1)
+            event_messages.append(
+                "You reach for the notebook, but you have no fresh name and face from a broadcast.\n"
+                "In this timeline, the notebook only answers when your target has just been paraded "
+                "across a screen. For now, the pages stay still."
+            )
+        else:
+            action_label = "write_name"
+            # Mark that we should consume the TV target *after* narration
+            consume_tv_target_after = True
 
-    # Creating an alibi or covering your tracks
+            # base suspicion changes (actual kill happens)
+            state.suspicion_L = _clamp(state.suspicion_L + 8)
+            state.suspicion_task_force = _clamp(state.suspicion_task_force + 5)
+
+            # EXTRA RISK: at home with cameras
+            if state.location == "home" and state.cameras_at_home:
+                state.suspicion_L = _clamp(state.suspicion_L + 10)
+                state.suspicion_task_force = _clamp(
+                    state.suspicion_task_force + 10
+                )
+
+    # Watch TV / screen to get a target
+    elif any(
+        phrase in text
+        for phrase in [
+            "watch tv",
+            "watch the tv",
+            "turn on tv",
+            "turn on the tv",
+            "watch the news",
+            "watch news",
+            "check the news",
+            "look at the tv",
+            "look at tv",
+            "look at the screen",
+            "watch the screen",
+            "watch a screen",
+        ]
+    ):
+        action_label = "watch_tv"
+        state.flags[TV_TARGET_FLAG] = True
+
+        # Very small suspicion bump – L may later correlate broadcasts and deaths
+        state.suspicion_L = _clamp(state.suspicion_L + 1)
+        state.suspicion_task_force = _clamp(state.suspicion_task_force + 1)
+
+    # Create an alibi / cover tracks
     elif any(k in text for k in ["alibi", "cover", "lie", "excuse"]):
         action_label = "alibi"
-        # These actions reduce suspicion for the Task Force and the public...
-        state.suspicion_task_force = _clamp(state.suspicion_task_force - 8)
-        state.suspicion_public = _clamp(state.suspicion_public - 3)
-        # ...but increase suspicion for the genius detective
-        state.suspicion_L = _clamp(state.suspicion_L + 3)
+        state.suspicion_task_force = _clamp(state.suspicion_task_force - 6)
+        state.suspicion_L = _clamp(state.suspicion_L + 2)
 
-    # Cooperating with / helping the investigation
+    # Cooperate with investigation
     elif ("cooperate" in text) or ("help" in text and "investigation" in text):
         action_label = "cooperate"
-        # Cooperation lowers public and Task Force suspicion...
-        state.suspicion_public = _clamp(state.suspicion_public - 5)
-        state.suspicion_task_force = _clamp(state.suspicion_task_force - 5)
-        # ...but makes the detective more suspicious (why are you so helpful?)
-        state.suspicion_L = _clamp(state.suspicion_L + 5)
+        state.suspicion_task_force = _clamp(state.suspicion_task_force - 4)
+        state.suspicion_L = _clamp(state.suspicion_L + 3)
 
-    # Hiding or relocating the notebook
+    # Hide notebook
     elif "hide" in text or "move the notebook" in text or "relocate" in text:
         action_label = "hide_notebook"
-        # If the notebook is currently not hidden, hide it
         if not state.notebook_hidden:
             state.notebook_hidden = True
-        # Even careful actions create a small suspicion drift
         state.suspicion_L = _clamp(state.suspicion_L + 1)
 
-    # Laying low and doing nothing
+    # Lay low
     elif "lay low" in text or "do nothing" in text or "stay quiet" in text:
         action_label = "lay_low"
-        # Laying low reduces suspicion a little bit
-        state.suspicion_L = _clamp(state.suspicion_L - 3)
-        state.suspicion_task_force = _clamp(state.suspicion_task_force - 2)
+        state.suspicion_L = _clamp(state.suspicion_L - 2)
+        state.suspicion_task_force = _clamp(state.suspicion_task_force - 1)
 
-    # Investigating L to build progress towards discovering their name
+    # ---------- Moving between locations ---------- #
+
+    elif any(
+        phrase in text
+        for phrase in [
+            "go home",
+            "return home",
+            "back home",
+            "to my room",
+            "to my house",
+        ]
+    ):
+        action_label = "move_home"
+        state.location = "home"
+        state.suspicion_L = _clamp(state.suspicion_L - 1)
+        state.suspicion_task_force = _clamp(state.suspicion_task_force - 1)
+        _maybe_grant_tv_target(state, event_messages)
+
+    elif any(
+        phrase in text
+        for phrase in [
+            "go to school",
+            "go to class",
+            "go to campus",
+            "to school",
+        ]
+    ):
+        action_label = "move_school"
+        state.location = "school"
+        state.suspicion_task_force = _clamp(state.suspicion_task_force - 1)
+        _maybe_grant_tv_target(state, event_messages)
+
+    elif any(
+        phrase in text
+        for phrase in [
+            "task force hq",
+            "go to hq",
+            "go to task force",
+            "meet the task force",
+            "go to police",
+        ]
+    ):
+        action_label = "move_task_force_hq"
+        state.location = "task_force_hq"
+        state.suspicion_task_force = _clamp(state.suspicion_task_force - 2)
+        state.suspicion_L = _clamp(state.suspicion_L + 2)
+        _maybe_grant_tv_target(state, event_messages)
+
+    elif any(
+        phrase in text
+        for phrase in [
+            "go downtown",
+            "go outside",
+            "go into the city",
+            "walk around town",
+            "go out",
+        ]
+    ):
+        action_label = "move_downtown"
+        state.location = "downtown"
+        _maybe_grant_tv_target(state, event_messages)
+
+    # Investigate L (only allowed at task_force_hq, with 40% failure chance)
     elif any(
         phrase in text
         for phrase in [
@@ -329,13 +486,92 @@ def run_step(state: GameState, user_input: str) -> Tuple[GameState, str]:
         ]
     ):
         action_label = "investigate_L"
-        # Each investigation step increases progress, up to a maximum of 3
-        state.l_investigation_progress = min(3, state.l_investigation_progress + 1)
-        # But poking around L raises suspicion
-        state.suspicion_L = _clamp(state.suspicion_L + 6)
-        state.suspicion_task_force = _clamp(state.suspicion_task_force + 3)
 
-    # Trying to discover L's true name (hard, gated win condition)
+        # Must be at Task Force HQ to really investigate L
+        if state.location != "task_force_hq":
+            event_messages.append(
+                "You try to piece together information about L from here, "
+                "but without direct access to the Task Force data at headquarters "
+                "it's mostly rumors and guesswork.\n"
+                "If you want to truly investigate L, you should go to task force hq first."
+            )
+        else:
+            # At HQ: 40% chance this attempt FAILS and spikes L's suspicion
+            if random.random() < 0.50:
+                # Failure: no progress, big suspicion jump for L
+                state.suspicion_L = _clamp(state.suspicion_L + 30)
+                event_messages.append(
+                    "At headquarters, you push a little too hard for details about L himself.\n"
+                    "Your questions linger in the air a bit too long, and you catch the way "
+                    "L's eyes rest on you.\n"
+                    "This attempt to investigate him backfires—his suspicion of you spikes sharply."
+                )
+            else:
+                # Success: normal investigation effects
+                state.l_investigation_progress = min(
+                    3, state.l_investigation_progress + 1
+                )
+                state.suspicion_L = _clamp(state.suspicion_L + 5)
+                state.suspicion_task_force = _clamp(state.suspicion_task_force + 3)
+
+                # Special one-time TV event that reveals a second Kira
+                if not state.flags.get(SECOND_KIRA_REVEALED_FLAG, False):
+                    state.flags[SECOND_KIRA_REVEALED_FLAG] = True
+                    event_messages.append(
+                        "While you're reviewing case files with the Task Force, a breaking-news banner "
+                        "cuts across the TV in the corner.\n"
+                        "A distorted voice claiming to be 'Kira' appears, demanding to speak directly "
+                        "with L. The style is theatrical and reckless—nothing like the careful pattern "
+                        "you've established.\n"
+                        "On screen and in the room, people start whispering about a 'second Kira' who "
+                        "may share your power but not your caution.\n"
+                        "If you can quietly befriend this second Kira, they might help you read how L "
+                        "reacts to new threats.\n"
+                        "Try commands like 'befriend second kira' or 'ally with the second kira'."
+                    )
+
+    # Befriend the second Kira (only after the TV reveal)
+    elif any(
+        phrase in text
+        for phrase in [
+            "befriend second kira",
+            "ally with second kira",
+            "ally with the second kira",
+            "contact second kira",
+            "meet second kira",
+            "work with second kira",
+        ]
+    ):
+        action_label = "befriend_second_kira"
+
+        if not state.flags.get(SECOND_KIRA_REVEALED_FLAG, False):
+            event_messages.append(
+                "You hear nothing but rumors. If there is a second Kira, you haven't seen enough "
+                "to reach them yet. Maybe you should investigate L at task force hq first."
+            )
+        elif state.flags.get(SECOND_KIRA_FRIEND_FLAG, False):
+            event_messages.append(
+                "Your fragile alliance with the second Kira is already in place. For now you both "
+                "keep your distance and watch how L responds."
+            )
+        else:
+            state.flags[SECOND_KIRA_FRIEND_FLAG] = True
+            # Second Kira's help gives you more insight into L
+            state.l_investigation_progress = min(
+                3, state.l_investigation_progress + 1
+            )
+            # But coordinated weird behavior also raises suspicion
+            state.suspicion_L = _clamp(state.suspicion_L + 4)
+            state.suspicion_task_force = _clamp(state.suspicion_task_force + 2)
+            event_messages.append(
+                "Through carefully coded messages, you manage to reach the second Kira.\n"
+                "They are impulsive and eager to please, willing to act just to see how L reacts.\n"
+                "By nudging their actions, you gain a clearer view of L's methods and timing.\n"
+                "Your understanding of L deepens (+1 L-investigation progress), but the "
+                "case also becomes stranger and harder to hide."
+            )
+
+    # Try to discover L's real name
     elif any(
         phrase in text
         for phrase in [
@@ -350,128 +586,125 @@ def run_step(state: GameState, user_input: str) -> Tuple[GameState, str]:
     ):
         action_label = "discover_L_name"
 
-        # Conditions to succeed:
-        # - at least 3 investigation steps
-        # - at least 6 turns into the story
-        # - L's suspicion not extremely high
         if (
             state.l_investigation_progress >= 3
             and state.turn >= 6
             and state.suspicion_L <= 70
         ):
-            # Mark that we know L's name and enter the victory state
             state.flags["l_name_known"] = True
             state.location = "victory"
             system_output = (
                 _suspicion_summary(state)
-                + "\nThrough careful manipulation, observation, and calculated risks, "
+                + "\nThrough careful investigation and controlled risks, "
                   "you finally piece together the detective's true identity.\n"
-                  "A real name replaces a single letter in your mind.\n\n"
-                  "With that name, the balance of power is no longer equal. "
-                  "The one person who could truly corner you is now exposed to the same "
-                  "silent judgment as everyone else.\n"
-                  "Whether you write it down or not, this world already belongs to Kira.\n"
-                  "Use the Reset button if you want to attempt a different fate."
+                  "With his real name in your hands, the one person who could "
+                  "truly corner you is no longer untouchable.\n"
+                  "This timeline now belongs to Kira.\n"
+                  "Use Reset if you want to explore a different path."
             )
             state.history.append({"system": system_output})
             return state, system_output
         else:
-            # If conditions are not met, the attempt fails and drastically raises suspicion
-            state.suspicion_L = _clamp(state.suspicion_L + 20)
-            state.suspicion_task_force = _clamp(state.suspicion_task_force + 10)
+            state.suspicion_L = _clamp(state.suspicion_L + 12)
+            state.suspicion_task_force = _clamp(state.suspicion_task_force + 8)
             system_output = (
                 _suspicion_summary(state)
                 + "\nYou reach too far, too soon.\n"
-                  "Your attempts to pry into the detective's identity hit hardened walls—"
-                  "fake backgrounds, dead ends, and suddenly watchful eyes.\n"
-                  "Someone on the other side tightens their grip on the investigation.\n"
-                  "If you want their name, you'll need more subtle groundwork first."
+                  "Your attempts to uncover L's identity run into fake records "
+                  "and suddenly watchful eyes.\n"
+                  "If you want his name, you need more groundwork first."
             )
             state.history.append({"system": system_output})
             return state, system_output
 
-    # Help command: print available actions
+    # Help
     elif text == "help":
         system_output = (
             "Commands you can try:\n"
-            "- 'write a name' to use the notebook\n"
+            "- 'watch tv' or 'watch the news' to get a target\n"
+            "- 'write a name' to use the notebook (only after watching a screen)\n"
+            "- 'look around' to see where you can move\n"
             "- 'create an alibi' or 'cover my tracks'\n"
             "- 'cooperate with the investigation'\n"
             "- 'lay low' or 'do nothing'\n"
             "- 'hide the notebook'\n"
-            "- 'investigate L' to carefully study the detective (build progress)\n"
-            "- later, attempt to 'find L's name' if you think you're ready\n"
-            "- 'status' to see suspicion levels and L-investigation progress\n"
+            "- 'investigate L' at task force hq to build progress (may reveal a second Kira, "
+            "but sometimes backfires and sharply raises L's suspicion)\n"
+            "- after the TV reveal: 'befriend second kira' to try forming an alliance\n"
+            "- move: 'go home', 'go to school', 'go to task force hq', 'go downtown'\n"
+            "- later: try to find L's name when you think you're ready\n"
+            "- 'status' to see location, cameras, and suspicion levels\n"
         )
         state.history.append({"system": system_output})
         return state, system_output
 
-    # Generic fallback: ambiguous action
+    # Fallback
     else:
         action_label = "other"
-        # Slight suspicion increase because ambiguous behavior can still be weird
-        state.suspicion_L = _clamp(state.suspicion_L + 2)
+        state.suspicion_L = _clamp(state.suspicion_L + 1)
 
-    # ---------- Check for win / lose conditions before narration ---------- #
+    # ---------- Location-based event: cameras at home ---------- #
 
-    # WIN CONDITION A: Kira reshapes the world (new world order)
     if (
-        state.suspicion_public >= 80
-        and state.suspicion_L <= 40
+        state.location == "home"
+        and state.suspicion_L >= 50
+        and not state.cameras_at_home
+    ):
+        state.cameras_at_home = True
+        state.cameras_revealed_to_player = True
+        event_messages.append(
+            "When you settle back into your room, something feels wrong.\n"
+            "A faint click from the ceiling, a lens glint near the bookshelf—"
+            "someone has installed hidden cameras in your home.\n"
+            "Using the notebook here is now extremely risky."
+        )
+
+    # ---------- Win / lose checks ---------- #
+
+    # Win path A – "new world order" with low suspicion
+    if (
+        state.suspicion_L <= 40
         and state.suspicion_task_force <= 40
-        and state.turn >= 8
+        and state.turn >= 10
     ):
         state.location = "victory"
         system_output = (
             _suspicion_summary(state)
             + "\nThe world tilts in your favor.\n"
-              "Fear, awe, and a twisted sense of safety spread through the public.\n"
-              "Crime plummets, and people begin to speak of an invisible judge\n"
-              "who punishes evil and spares the obedient.\n\n"
-              "The investigation has names and theories, but nothing that can touch you.\n"
-              "In this timeline, you have become the architect of a new order.\n"
-              "Use the Reset button if you want to attempt a different path."
+              "Deaths continue to follow the pattern you choose, but L and the Task\n"
+              "Force never quite manage to pin them on you. You remain their ally\n"
+              "on paper and their god in secret.\n"
+              "Use Reset if you want to attempt a different path."
         )
         state.history.append({"system": system_output})
         return state, system_output
 
-    # LOSE CONDITION: L or Task Force reaches full suspicion
+    # Lose – L or Task Force reach 100 suspicion
     if state.suspicion_L >= 100 or state.suspicion_task_force >= 100:
         state.location = "caught"
         system_output = (
             _suspicion_summary(state)
-            + "\nAlarms ring through the Task Force headquarters.\n"
-              "Your patterns, your alibis, and your timing all point in one direction.\n"
-              "They confront you with the evidence—cold eyes and a quiet, final question.\n"
-              "You have been exposed as the killer. Game over.\n"
-              "Use the Reset button to start a new timeline."
+            + "\nThe pieces finally line up.\n"
+              "Your movements, alibis, and timing all converge on one conclusion.\n"
+              "You are confronted with the evidence and quietly cornered.\n"
+              "You have been exposed as Kira. Game over.\n"
+              "Use Reset to start a new timeline."
         )
         state.history.append({"system": system_output})
         return state, system_output
 
-    # ---------- Use GPT if available, otherwise a simple fallback ---------- #
+    # ---------- GPT narration ---------- #
 
-    if USE_GPT:
-        try:
-            # Ask the model to generate narration based on the updated state
-            narrative = generate_narration(state, user_input, action_label)
-            # Add a [GPT] tag so you can see in the UI that the model was used
-            system_output = "[GPT]\n" + narrative + "\n\n" + _suspicion_summary(state)
-        except Exception as e:
-            # If anything goes wrong with the API, show an error and still show state
-            system_output = (
-                "[GPT ERROR] The narration engine failed.\n"
-                f"(Error: {e})\n\n"
-                + _suspicion_summary(state)
-            )
-    else:
-        # Non-GPT fallback so the game still runs without an API key
-        system_output = (
-            "[NO GPT]\n"
-            f"You act: '{user_input}'. Suspicion and state are updated.\n\n"
-            + _suspicion_summary(state)
-        )
+    narrative = generate_narration(state, user_input, action_label)
+    system_output = "[GPT]\n" + narrative
 
-    # Record the system output in history and return the updated state + text
+    if event_messages:
+        system_output = "\n\n".join(event_messages + [system_output])
+
+    # Now that narration is done, actually consume the TV target if needed
+    if consume_tv_target_after:
+        state.flags[TV_TARGET_FLAG] = False
+
+    # (No extra suspicion summary here – that's in status/debug/ending.)
     state.history.append({"system": system_output})
     return state, system_output
